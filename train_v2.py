@@ -2,25 +2,25 @@ import kagglehub
 import os
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras import layers, models, optimizers
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras import layers, models, optimizers, regularizers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
 import seaborn as sns
 
 # ---------------------------------------------------------
-# 1. VERİ İNDİRME (KAGGLEHUB)
+# 1. KLASÖR VE VERİ AYARLARI
 # ---------------------------------------------------------
-print("Veri seti indiriliyor...")
+# Sonuçları kaydedeceğimiz özel klasörü oluşturalım
+output_folder = 'sonuclar_custom_v2'
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+    print(f"Klasör oluşturuldu: {output_folder}")
+
+print("Veri yolu kontrol ediliyor...")
 path = kagglehub.dataset_download("paultimothymooney/chest-xray-pneumonia")
-print("Veri seti şuraya indirildi:", path)
-
-# Kagglehub bazen ana klasörü verir, dataset yapısı içinde 'chest_xray' klasörü olabilir.
-# Yolu dinamik olarak ayarlayalım:
 base_dir = os.path.join(path, 'chest_xray')
-
-# Eğer indirdiği yerde doğrudan train/test varsa base_dir'i path yapalım (kontrol)
 if not os.path.exists(base_dir):
     base_dir = path
 
@@ -28,24 +28,19 @@ train_dir = os.path.join(base_dir, 'train')
 test_dir = os.path.join(base_dir, 'test')
 val_dir = os.path.join(base_dir, 'val')
 
-print(f"Eğitim Yolu: {train_dir}")
-print(f"Test Yolu: {test_dir}")
-
 # ---------------------------------------------------------
-# 2. HİPERPARAMETRELER VE GPU KONTROLÜ
+# 2. HİPERPARAMETRELER
 # ---------------------------------------------------------
-print("GPU Mevcut mu?: ", len(tf.config.list_physical_devices('GPU')))
-
 IMG_WIDTH, IMG_HEIGHT = 150, 150
 BATCH_SIZE = 32
-EPOCHS = 15
+EPOCHS = 20  # Biraz daha uzun tutalım, erken durdurma zaten var.
 
 # ---------------------------------------------------------
-# 3. VERİ ÖN İŞLEME (DATA AUGMENTATION)
+# 3. VERİ ÖN İŞLEME (Data Augmentation)
 # ---------------------------------------------------------
 train_datagen = ImageDataGenerator(
     rescale=1. / 255,
-    rotation_range=15,
+    rotation_range=20,  # Açıyı artırdık (Daha zor görev)
     width_shift_range=0.1,
     height_shift_range=0.1,
     shear_range=0.1,
@@ -79,119 +74,110 @@ test_generator = test_val_datagen.flow_from_directory(
 )
 
 # ---------------------------------------------------------
-# 4. CUSTOM CNN MODEL MİMARİSİ
+# 4. CUSTOM CNN V2 (Optimize Edilmiş Mimari)
 # ---------------------------------------------------------
 model = models.Sequential([
-    # Conv Block 1
-    layers.Conv2D(32, (3, 3), activation='relu', input_shape=(IMG_WIDTH, IMG_HEIGHT, 3)),
+    # 1. Blok
+    layers.Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=(IMG_WIDTH, IMG_HEIGHT, 3)),
     layers.BatchNormalization(),
     layers.MaxPooling2D((2, 2)),
 
-    # Conv Block 2
-    layers.Conv2D(64, (3, 3), activation='relu'),
+    # 2. Blok
+    layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
     layers.BatchNormalization(),
     layers.MaxPooling2D((2, 2)),
+    layers.Dropout(0.2),  # Konvolüsyon arasına ufak dropout ekledik
 
-    # Conv Block 3
-    layers.Conv2D(128, (3, 3), activation='relu'),
+    # 3. Blok
+    layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
     layers.BatchNormalization(),
     layers.MaxPooling2D((2, 2)),
+    layers.Dropout(0.3),
 
-    # Conv Block 4
-    layers.Conv2D(128, (3, 3), activation='relu'),
+    # 4. Blok (Opsiyonel: Derinliği artırıp filtreyi sabit tuttuk)
+    layers.Conv2D(128, (3, 3), activation='relu', padding='same'),
     layers.BatchNormalization(),
     layers.MaxPooling2D((2, 2)),
+    layers.Dropout(0.4),
 
-    # Dense Block
+    # Sınıflandırma Bloğu (Classifier)
     layers.Flatten(),
-    layers.Dropout(0.5),
-    layers.Dense(512, activation='relu'),
+    # Dense katmanını 512'den 128'e düşürdük ve L2 Regularization ekledik
+    layers.Dense(128, activation='relu', kernel_regularizer=regularizers.l2(0.001)),
+    layers.Dropout(0.5),  # Ana dropout
     layers.Dense(1, activation='sigmoid')
 ])
 
 model.compile(loss='binary_crossentropy',
-              optimizer=optimizers.Adam(learning_rate=1e-4),
+              optimizer=optimizers.Adam(learning_rate=1e-4),  # Yavaş ve emin adımlarla
               metrics=['accuracy'])
 
-# ---------------------------------------------------------
-# 5. EĞİTİM
-# ---------------------------------------------------------
-early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+model.summary()
 
-print("Model Eğitimi Başlıyor...")
+# ---------------------------------------------------------
+# 5. EĞİTİM (CALLBACKS İLE)
+# ---------------------------------------------------------
+# Patience'ı artırdık, hemen pes etmesin.
+early_stop = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+
+print("Custom CNN V2 Eğitimi Başlıyor...")
 history = model.fit(
     train_generator,
     epochs=EPOCHS,
     validation_data=validation_generator,
-    callbacks=[early_stop]
+    callbacks=[early_stop, reduce_lr]
 )
-# ... (Yukarıdaki eğitim kodları aynı kalacak) ...
 
 # ---------------------------------------------------------
-# 6. GRAFİKLERİ KAYDETME (PNG ÇIKTISI)
+# 6. SONUÇLARI KAYDETME (V2 Klasörüne)
 # ---------------------------------------------------------
-print("Grafikler oluşturuluyor ve kaydediliyor...")
-
-# Accuracy ve Loss Grafiği
+# Accuracy Grafiği
 plt.figure(figsize=(14, 5))
-
-# Sol taraf: Accuracy
 plt.subplot(1, 2, 1)
 plt.plot(history.history['accuracy'], label='Eğitim Başarısı')
 plt.plot(history.history['val_accuracy'], label='Doğrulama Başarısı')
-plt.title('Model Doğruluğu')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
+plt.title('V2 Model Doğruluğu')
 plt.legend()
 
-# Sağ taraf: Loss
+# Loss Grafiği
 plt.subplot(1, 2, 2)
 plt.plot(history.history['loss'], label='Eğitim Kaybı')
 plt.plot(history.history['val_loss'], label='Doğrulama Kaybı')
-plt.title('Model Kaybı')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
+plt.title('V2 Model Kaybı')
 plt.legend()
 
-# PNG olarak kaydet
-plt.savefig('basari_grafigi.png', dpi=300) # dpi=300 yüksek kalite demektir (makale için ideal)
+save_path_graph = os.path.join(output_folder, 'v2_basari_grafigi.png')
+plt.savefig(save_path_graph, dpi=300)
 plt.show()
-print("-> basari_grafigi.png kaydedildi.")
 
-# ---------------------------------------------------------
-# 7. RAPOR VE CONFUSION MATRIX KAYDETME (TXT ve PNG)
-# ---------------------------------------------------------
-print("Test sonuçları hesaplanıyor...")
+# Test Raporu
+print("Test ediliyor...")
 predictions = model.predict(test_generator)
 y_pred = np.where(predictions > 0.5, 1, 0)
 y_true = test_generator.classes
 
-# Confusion Matrix Grafiği
+# Confusion Matrix
 cm = confusion_matrix(y_true, y_pred)
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
             xticklabels=['Normal', 'Pneumonia'],
             yticklabels=['Normal', 'Pneumonia'])
-plt.title('Confusion Matrix (Karmaşıklık Matrisi)')
-plt.ylabel('Gerçek Değer')
-plt.xlabel('Tahmin Edilen')
-
-# PNG olarak kaydet
-plt.savefig('confusion_matrix.png', dpi=300)
+plt.title('V2 Confusion Matrix')
+save_path_cm = os.path.join(output_folder, 'v2_confusion_matrix.png')
+plt.savefig(save_path_cm, dpi=300)
 plt.show()
-print("-> confusion_matrix.png kaydedildi.")
 
-# Metin Raporunu TXT Olarak Kaydetme
+# Metin Raporu
 report = classification_report(y_true, y_pred, target_names=['Normal', 'Pneumonia'])
+print(report)
 
-with open('sonuc_raporu.txt', 'w', encoding='utf-8') as f:
-    f.write("--- MODEL SONUC RAPORU ---\n\n")
-    f.write(f"Eğitim Süresi (Epoch): {EPOCHS}\n")
-    f.write(f"Batch Size: {BATCH_SIZE}\n\n")
-    f.write("--- SINIFLANDIRMA RAPORU ---\n")
+save_path_txt = os.path.join(output_folder, 'v2_sonuc_raporu.txt')
+with open(save_path_txt, 'w', encoding='utf-8') as f:
+    f.write("--- CUSTOM CNN V2 (Regularized) RAPORU ---\n")
+    f.write("Yapılan Değişiklikler: Dense 128'e düşürüldü, L2 Regularization eklendi, Dropout artırıldı.\n\n")
     f.write(report)
-    f.write("\n\n--- CONFUSION MATRIX ---\n")
+    f.write("\n\nConfusion Matrix:\n")
     f.write(str(cm))
 
-print("-> sonuc_raporu.txt kaydedildi.")
-print("Tüm işlemler tamamlandı!")
+print(f"Tüm sonuçlar '{output_folder}' klasörüne kaydedildi.")
